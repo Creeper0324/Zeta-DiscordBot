@@ -674,6 +674,95 @@ def get_voice_client_status_str(status_code: int) -> str:
     return voice_client_status
 
 
+# 每个服务器仅保存运行期播放时钟。队列本身仍由GuildPlaylist管理；机器人重启后
+# 没有正在输出的音频，因此不需要持久化这个状态。
+_playback_states: Dict[int, dict] = {}
+
+
+def _new_playback_session(guild_id: int, target_audio: audio.Audio,
+                          position: float = 0, paused: bool = False) -> object:
+    session_id = object()
+    duration = max(0, int(target_audio.get_duration() or 0))
+    position = max(0.0, min(float(position), float(duration))) if duration else max(0.0, float(position))
+    _playback_states[int(guild_id)] = {
+        "session_id": session_id,
+        "audio_uid": target_audio.get_uid(),
+        "position": position,
+        "duration": duration,
+    }
+    return session_id
+
+
+def _playback_position(guild_id: int) -> int:
+    state = _playback_states.get(int(guild_id))
+    if state is None:
+        return 0
+    position = float(state.get("position") or 0)
+    duration = int(state.get("duration") or 0)
+    if duration > 0:
+        position = min(position, float(duration))
+    return max(0, int(position))
+
+
+def _advance_playback_position(guild_id: int, session_id, pcm_bytes: int) -> None:
+    """按实际送往Discord的48kHz双声道16位PCM字节数推进时钟。"""
+    state = _playback_states.get(int(guild_id))
+    if state is None or state.get("session_id") is not session_id:
+        return
+    state["position"] = float(state.get("position") or 0) + max(0, int(pcm_bytes)) / 192000.0
+
+
+def _invalidate_playback_session(guild_id: int) -> None:
+    """让旧FFmpeg结束回调失效，供跳转时停止并原曲重播。"""
+    state = _playback_states.get(int(guild_id))
+    if state is not None:
+        state["session_id"] = object()
+
+
+class _PositionTrackingAudioSource(discord.AudioSource):
+    """用实际播放的PCM帧计数，避免网络缓冲时间被误算为播放进度。"""
+
+    def __init__(self, source: discord.AudioSource, guild_id: int, session_id) -> None:
+        self.source = source
+        self.guild_id = int(guild_id)
+        self.session_id = session_id
+
+    def read(self) -> bytes:
+        data = self.source.read()
+        if data:
+            _advance_playback_position(self.guild_id, self.session_id, len(data))
+        return data
+
+    def is_opus(self) -> bool:
+        return self.source.is_opus()
+
+    def cleanup(self) -> None:
+        self.source.cleanup()
+
+
+def _parse_seek_timestamp(value: str) -> int:
+    """解析秒、MM:SS或HH:MM:SS，拒绝模糊及越界格式。"""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("时间戳不能为空")
+    if text.isascii() and text.isdigit():
+        return int(text)
+    separator = ":" if ":" in text else "：" if "：" in text else None
+    if separator is None:
+        raise ValueError("请使用秒数、MM:SS 或 HH:MM:SS 格式")
+    parts = text.split(separator)
+    if len(parts) not in (2, 3) or any(
+        not part or not part.isascii() or not part.isdigit() for part in parts
+    ):
+        raise ValueError("请使用秒数、MM:SS 或 HH:MM:SS 格式")
+    numbers = [int(part) for part in parts]
+    if numbers[-1] >= 60 or (len(numbers) == 3 and numbers[-2] >= 60):
+        raise ValueError("秒和小时格式中的分钟必须小于60")
+    if len(numbers) == 2:
+        return numbers[0] * 60 + numbers[1]
+    return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+
+
 async def autocomplete_search_sites(ctx: discord.AutocompleteContext):
     """
     search指令用自动填充 - 可选的搜索平台
@@ -877,6 +966,32 @@ async def list(ctx: discord.ApplicationContext):
     if not await command_check(ctx):
         return
     await list_callback(ctx)
+
+
+@bot.slash_command(
+    name="seek",
+    name_localizations=lang.get_command_name("seek"),
+    description="Jump to a position in the current track",
+    description_localizations={
+        "zh-CN": "跳转到当前歌曲或视频的指定播放位置",
+        "en-US": "Jump to a position in the current track",
+    },
+)
+@option(
+    "position",
+    description="秒数、MM:SS 或 HH:MM:SS，例如 5:14",
+    name_localizations={"zh-CN": "时间", "en-US": "position"},
+    description_localizations={
+        "zh-CN": "输入秒数、MM:SS 或 HH:MM:SS，例如 5:14",
+        "en-US": "Seconds, MM:SS, or HH:MM:SS, for example 5:14",
+    },
+    required=True,
+)
+async def seek(ctx: discord.ApplicationContext, position: str) -> None:
+    await ctx.defer()
+    if not await command_check(ctx):
+        return
+    await seek_callback(ctx, position)
 
 
 @bot.slash_command(name_localizations=lang.get_command_name("skip"), description="跳过正在播放或播放列表中的音频")
@@ -1532,7 +1647,8 @@ def _replace_stream_with_local(ctx: discord.ApplicationContext, target_audio: au
 
 async def _fallback_and_replay(ctx: discord.ApplicationContext, target_audio: audio.Audio,
                                response=None, function_call: bool = False,
-                               unlock_now_playing: bool = False) -> bool:
+                               unlock_now_playing: bool = False,
+                               start_position: float = 0) -> bool:
     """下载流式播放失败的单曲并立即从本地文件重新播放。"""
     if unlock_now_playing:
         audio_lib_main.unlock_audio(f"{ctx.guild.id}_NOW_PLAYING", target_audio)
@@ -1550,21 +1666,29 @@ async def _fallback_and_replay(ctx: discord.ApplicationContext, target_audio: au
     replacement = _replace_stream_with_local(ctx, target_audio, download_result.result)
     await play_audio(
         ctx, replacement, response=response, function_call=function_call,
-        allow_stream_fallback=False,
+        allow_stream_fallback=False, start_position=start_position,
     )
     return True
 
 
 async def _handle_playback_after(ctx: discord.ApplicationContext, target_audio: audio.Audio,
-                                 returncode: Optional[int]) -> None:
+                                 returncode: Optional[int], session_id=None,
+                                 start_position: float = 0) -> None:
     """区分正常结束、主动停止和FFmpeg网络流故障。"""
+    if session_id is not None:
+        state = _playback_states.get(int(ctx.guild.id))
+        if state is None or state.get("session_id") is not session_id:
+            return
     if target_audio.is_stream() and returncode not in (None, 0):
-        if await _fallback_and_replay(ctx, target_audio, unlock_now_playing=True):
+        if await _fallback_and_replay(
+            ctx, target_audio, unlock_now_playing=True,
+            start_position=start_position,
+        ):
             return
     await play_next(ctx)
 
 
-async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio, response: Union[discord.Interaction, discord.InteractionMessage, None] = None, function_call: bool = False, allow_stream_fallback: bool = True) -> None:
+async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio, response: Union[discord.Interaction, discord.InteractionMessage, None] = None, function_call: bool = False, allow_stream_fallback: bool = True, start_position: float = 0, start_paused: bool = False, update_playing_message: bool = True) -> None:
     """
     在<ctx>中的音频端播放音频<target_audio>，如果<single>为True则发送单曲加入成功通知
     <response>为用来编辑的加载信息，如果为None则发送新的通知
@@ -1579,22 +1703,29 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
     source = target_audio.get_path()
     before_options = None
     buffered_stream = None
+    start_position = max(0.0, float(start_position))
     if target_audio.is_stream():
         try:
             source, before_options = await _resolve_stream_source(target_audio)
-            buffered_stream = await _open_prebuffered_http_stream(
-                source, headers=_stream_http_headers(target_audio),
-            )
-            source = buffered_stream
-            before_options = "-nostdin"
+            if start_position > 0:
+                before_options = f"{before_options} {shlex.join(['-ss', str(start_position)])}"
+            else:
+                buffered_stream = await _open_prebuffered_http_stream(
+                    source, headers=_stream_http_headers(target_audio),
+                )
+                source = buffered_stream
+                before_options = "-nostdin"
         except Exception as exception:
             if buffered_stream is not None:
                 buffered_stream.close()
             await console.on_error(exception)
             if allow_stream_fallback and await _fallback_and_replay(
-                    ctx, target_audio, response=response, function_call=function_call):
+                    ctx, target_audio, response=response, function_call=function_call,
+                    start_position=start_position):
                 return
             raise
+    elif start_position > 0:
+        before_options = shlex.join(["-nostdin", "-ss", str(start_position)])
 
     audio_lib_main.lock_audio(f"{ctx.guild.id}_NOW_PLAYING", target_audio)
     ffmpeg_source = None
@@ -1607,16 +1738,27 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
             options="-vn" if target_audio.is_stream() else None,
         )
 
+        session_id = _new_playback_session(
+            ctx.guild.id, target_audio, start_position, paused=start_paused,
+        )
+
         def after_playback(_error):
             if buffered_stream is not None:
                 buffered_stream.close()
             process = getattr(ffmpeg_source, "_process", None)
             returncode = process.poll() if process is not None else None
             asyncio.run_coroutine_threadsafe(
-                _handle_playback_after(ctx, target_audio, returncode), bot.loop
+                _handle_playback_after(
+                    ctx, target_audio, returncode, session_id, start_position,
+                ), bot.loop
             )
 
-        voice_client.play(discord.PCMVolumeTransformer(ffmpeg_source), after=after_playback)
+        tracked_source = _PositionTrackingAudioSource(
+            ffmpeg_source, ctx.guild.id, session_id,
+        )
+        voice_client.play(discord.PCMVolumeTransformer(tracked_source), after=after_playback)
+        if start_paused:
+            voice_client.pause()
     except Exception as exception:
         audio_lib_main.unlock_audio(f"{ctx.guild.id}_NOW_PLAYING", target_audio)
         if ffmpeg_source is not None:
@@ -1625,7 +1767,8 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
             buffered_stream.close()
         await console.on_error(exception)
         if target_audio.is_stream() and allow_stream_fallback and await _fallback_and_replay(
-                ctx, target_audio, response=response, function_call=function_call):
+                ctx, target_audio, response=response, function_call=function_call,
+                start_position=start_position):
             return
         raise
     voice_client.source.volume = current_guild.get_voice_volume() / 100.0
@@ -1633,12 +1776,12 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
     play_mode = "流式播放" if target_audio.is_stream() else "播放"
     await console.rp(f"开始{play_mode}：{target_audio.get_title()} 时长：{target_audio.get_duration_str()}", ctx.guild)
     playing_icon_filename = "vinyl_loop_playing_animated_infinite_100px.gif"
-    if function_call:
-        message, embed = await embed_respond(ctx, description=f"**{target_audio.get_title()}**", author_name=f"正在播放\u2003[{target_audio.get_duration_str()}]", author_icon_url=icon.url(playing_icon_filename), thumbnail=target_audio.get_cover_url(), files=icon_lib.files(playing_icon_filename), silent=True)
-    else:
-        message, embed = await embed_eos(ctx, response, description=f"**{target_audio.get_title()}**", author_name=f"正在播放\u2003[{target_audio.get_duration_str()}]", author_icon_url=icon.url(playing_icon_filename), thumbnail=target_audio.get_cover_url(), files=icon_lib.files(playing_icon_filename), silent=True)
-
-    await current_guild.refresh_playing_message(message, embed)
+    if update_playing_message:
+        if function_call:
+            message, embed = await embed_respond(ctx, description=f"**{target_audio.get_title()}**", author_name=f"正在播放\u2003[{target_audio.get_duration_str()}]", author_icon_url=icon.url(playing_icon_filename), thumbnail=target_audio.get_cover_url(), files=icon_lib.files(playing_icon_filename), silent=True)
+        else:
+            message, embed = await embed_eos(ctx, response, description=f"**{target_audio.get_title()}**", author_name=f"正在播放\u2003[{target_audio.get_duration_str()}]", author_icon_url=icon.url(playing_icon_filename), thumbnail=target_audio.get_cover_url(), files=icon_lib.files(playing_icon_filename), silent=True)
+        await current_guild.refresh_playing_message(message, embed)
     await current_guild.refresh_list_view()
 
 
@@ -1676,6 +1819,7 @@ async def play_next(ctx: discord.ApplicationContext) -> None:
         break
 
     if len(current_playlist) == 0:
+        _playback_states.pop(int(ctx.guild.id), None)
         await console.rp("播放队列已结束", ctx.guild)
         finished_icon_filename = "record_button_in_reveal_animated_0ms_100px.gif"
         await embed_send(ctx, author_name="播放队列已结束", author_icon_url=icon.url(finished_icon_filename), files=icon_lib.files(finished_icon_filename))
@@ -2362,6 +2506,73 @@ async def list_callback(ctx: discord.ApplicationContext):
         await previous_menu.on_override()
 
 
+async def seek_callback(ctx: discord.ApplicationContext, position: str) -> None:
+    """停止当前FFmpeg会话并从指定位置重启同一首音频。"""
+    await guild_lib.check(ctx, audio_lib_main)
+    voice_client = ctx.guild.voice_client
+    current_guild = guild_lib.get_guild(ctx)
+    current_playlist = current_guild.get_playlist()
+    icon_error_filename = "error_cross_hover_pinch_orange_animated_0ms_100px.gif"
+
+    try:
+        target_position = _parse_seek_timestamp(position)
+    except ValueError as exception:
+        await embed_respond(
+            ctx, author_name=str(exception), colour=orange,
+            author_icon_url=icon.url(icon_error_filename),
+            files=icon_lib.files(icon_error_filename), silent=True,
+        )
+        return
+
+    if current_playlist.is_empty() or voice_client is None or not (
+        voice_client.is_playing() or voice_client.is_paused()
+    ):
+        await embed_respond(ctx, "当前没有正在播放的歌曲或视频", silent=True)
+        return
+
+    current_audio = current_playlist.get_audio(0)
+    duration = int(current_audio.get_duration() or 0)
+    if duration <= 0:
+        await embed_respond(ctx, "当前音频时长未知，无法调整播放进度", silent=True)
+        return
+    if target_position > duration:
+        await embed_respond(
+            ctx,
+            f"目标位置 {utils.convert_duration_to_str(target_position)} 超过当前音频总时长 "
+            f"{utils.convert_duration_to_str(duration)}",
+            silent=True,
+        )
+        return
+
+    was_paused = voice_client.is_paused()
+    _invalidate_playback_session(ctx.guild.id)
+    voice_client.stop()
+    try:
+        await play_audio(
+            ctx, current_audio, start_position=target_position,
+            start_paused=was_paused, update_playing_message=False,
+        )
+    except Exception as exception:
+        await console.on_error(exception)
+        await embed_respond(ctx, "跳转失败，当前音频源暂时不可用", silent=True)
+        return
+
+    position_str = utils.convert_duration_to_str(target_position)
+    duration_str = utils.convert_duration_to_str(duration)
+    pause_note = "（保持暂停）" if was_paused else ""
+    await console.rp(
+        f"用户 {ctx.author} 将 {current_audio.get_title()} 跳转至 {position_str}{pause_note}",
+        ctx.guild,
+    )
+    await embed_respond(
+        ctx,
+        description=f"**{utils.markdown_escape(current_audio.get_title())}**",
+        author_name=f"已跳转至 {position_str} / {duration_str}{pause_note}",
+        silent=True,
+    )
+    await current_guild.refresh_list_view()
+
+
 async def skip_callback(ctx, first_index: Union[int, str, None] = None, second_index: Union[int, None] = None, command_call: bool = False, refresh_view: bool = True):
     """
     使机器人跳过指定的歌曲，并删除对应歌曲的文件
@@ -2851,11 +3062,20 @@ class PlaylistMenu(View):
         embed_playlist_length_str = f"列表长度：{len(self.playlist)}"
         embed_playlist_duration_str = f"总时长：{self.playlist.get_duration_str()}"
         embed_voice_client_status_str = f"状态：{self.voice_client_status_str}"
+        embed_playback_position_str = ""
+        if len(self.playlist) > 0 and self.voice_client_status in (1, 2):
+            current_audio = self.playlist.get_audio(0)
+            current_position = _playback_position(self.ctx.guild.id)
+            embed_playback_position_str = (
+                f"播放进度：{utils.convert_duration_to_str(current_position)} / "
+                f"{current_audio.get_duration_str()}\n"
+            )
 
         # 设置嵌套元素
         # 使用\u2003全角空格加宽间距
         self.embed.description = (
             f"{embed_playlist_length_str}\u2003\u2003{embed_playlist_duration_str}\u2003\u2003{embed_voice_client_status_str}\n\n"
+            f"{embed_playback_position_str}"
             f"{self.playlist_pages[self.page_num]}"
         )
         self.embed.timestamp = utils.ctime_datetime()

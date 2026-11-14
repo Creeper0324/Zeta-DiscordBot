@@ -29,6 +29,7 @@ class PartsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.queue = Mock()
         self.queue.is_empty.return_value = False
+        self.queue.append_audios.side_effect = lambda items: len(items)
         self.guild = SimpleNamespace(get_playlist=lambda: self.queue, refresh_list_view=AsyncMock())
         self.ctx = SimpleNamespace(guild=SimpleNamespace(voice_client=Mock()))
         self.audio_lib = SimpleNamespace(download_ytdlp=AsyncMock(), download_bilibili=AsyncMock())
@@ -77,28 +78,25 @@ class PartsTests(unittest.IsolatedAsyncioTestCase):
         audio = Mock()
         audio.get_title.return_value = "选中的歌曲"
         audio.get_duration_str.return_value = "03:00"
-        self.get_info.side_effect = lambda url: utils.success_result({"id": "BV139pxeGENb_p" + url.split("p=")[-1]})
         self.audio_lib.download_ytdlp.return_value = utils.success_result(audio)
         await menu.play_select([3, 1])
-        self.assertEqual([c.args[0] for c in self.get_info.await_args_list], [
-            "https://www.bilibili.com/video/BV139pxeGENb?p=3",
-            "https://www.bilibili.com/video/BV139pxeGENb?p=1",
-        ])
+        self.get_info.assert_not_awaited()
         self.assertEqual([c.args[1]["id"] for c in self.audio_lib.download_ytdlp.await_args_list],
                          ["BV139pxeGENb_p3", "BV139pxeGENb_p1"])
         self.assertTrue(all(c.args[2] is DownloadType.BILIBILI_P for c in self.audio_lib.download_ytdlp.await_args_list))
         self.audio_lib.download_bilibili.assert_not_awaited()
-        self.assertEqual(self.queue.append_audio.call_count, 2)
+        self.queue.append_audios.assert_called_once()
+        self.assertEqual(
+            [item.get_title() for item in self.queue.append_audios.call_args.args[0]],
+            ["选中的歌曲", "选中的歌曲"],
+        )
         self.assertFalse(menu.children)
 
     async def test_cancel_between_parts_stops_remaining_requests(self):
         menu = self.menu()
-        async def cancel_during_info(url):
-            menu.cancel_requested = True
-            return utils.success_result({"id": "BV139pxeGENb_p1"})
-        self.get_info.side_effect = cancel_during_info
+        menu.cancel_requested = True
         await menu.play_select([1, 2])
-        self.get_info.assert_awaited_once()
+        self.get_info.assert_not_awaited()
         self.audio_lib.download_ytdlp.assert_not_awaited()
 
     async def test_buttons_validate_range_and_bulk_limit(self):
@@ -106,8 +104,11 @@ class PartsTests(unittest.IsolatedAsyncioTestCase):
         interaction = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock(), defer=AsyncMock()))
         menu.play_select = AsyncMock()
         await menu.button_all_callback.callback(interaction)
-        menu.play_select.assert_not_awaited()
-        for selection in ("0", "141", "1-11", "1,", "1-"):
+        menu.play_select.assert_awaited_once_with(list(range(1, 101)))
+
+        menu = self.menu(140)
+        menu.play_select = AsyncMock()
+        for selection in ("0", "141", "1-101", "1,", "1-"):
             menu.result = list(selection)
             await menu.button_confirm_callback.callback(interaction)
             menu.play_select.assert_not_awaited()
@@ -153,7 +154,8 @@ class PartsTests(unittest.IsolatedAsyncioTestCase):
         ]
         await menu.play_select([1, 2])
         self.assertEqual(self.audio_lib.download_ytdlp.await_count, 2)
-        self.queue.append_audio.assert_called_once()
+        self.queue.append_audios.assert_called_once()
+        self.assertEqual(len(self.queue.append_audios.call_args.args[0]), 1)
         self.assertFalse(menu.processing)
 
     async def test_youtube_playlist_still_uses_youtube_urls(self):
@@ -162,7 +164,11 @@ class PartsTests(unittest.IsolatedAsyncioTestCase):
         self.get_info.return_value = utils.success_result({"id": "abcdefghijk"})
         self.audio_lib.download_ytdlp.return_value = utils.success_result(Mock())
         await menu.play_select([1])
-        self.get_info.assert_awaited_once_with("https://www.youtube.com/watch?v=abcdefghijk")
+        self.get_info.assert_not_awaited()
+        self.assertEqual(
+            self.audio_lib.download_ytdlp.call_args.args[0],
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        )
         self.assertIs(self.audio_lib.download_ytdlp.call_args.args[2], DownloadType.YOUTUBE_PLAYLIST)
 
 

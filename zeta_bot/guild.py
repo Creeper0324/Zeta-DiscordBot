@@ -100,6 +100,7 @@ class Guild:
         if mode_code not in [0, 1, 2, 3, 4]:
             return False
         self._play_mode = mode_code
+        self.save()
         return True
 
     async def refresh_list_view(self) -> None:
@@ -132,6 +133,7 @@ class Guild:
 
     def load(self) -> None:
         loaded_dict = utils.json_load(self._path)
+        self._play_mode = int(loaded_dict.get("play_mode", 0))
         self.playedlist = playlist.playlist_decoder(loaded_dict["playedlist"])
         self.playlist = GuildPlaylist(self, self._audio_file_library)
         guild_playlist_loader(self.playlist, loaded_dict["playlist"])
@@ -140,6 +142,7 @@ class Guild:
         return {
             "id": self._id,
             "name": self._name,
+            "play_mode": self._play_mode,
             "playlist": self.playlist,
             "playedlist": self.playedlist
         }
@@ -282,6 +285,22 @@ class GuildPlaylist(playlist.Playlist):
             return True
         else:
             return False
+
+    def append_audios(self, new_audios: list[audio.Audio]) -> int:
+        """一次锁定、追加并保存多个队列项目，避免导入歌单时反复写盘。"""
+        if not new_audios:
+            return 0
+        available = len(new_audios)
+        if self._limitation is not None:
+            available = max(0, min(available, self._limitation - len(self._playlist)))
+        accepted = new_audios[:available]
+        self._playlist.extend(accepted)
+        self._duration += sum(item.get_duration() for item in accepted)
+        for item in accepted:
+            self._file_library.lock_audio(str(self._guild.get_id()), item)
+        if accepted:
+            self._guild.save()
+        return len(accepted)
 
     def insert_audio(self, new_audio: audio.Audio, index: int) -> bool:
         """

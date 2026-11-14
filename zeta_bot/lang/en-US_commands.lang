@@ -9,6 +9,7 @@ pause=pause
 resume=resume
 list=playlist
 seek=seek
+repeat=repeat
 skip=skip-audio
 skipi=skip-audio-by-index
 move=move-audio

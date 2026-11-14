@@ -9,6 +9,7 @@ pause=暂停
 resume=继续播放
 list=播放列表
 seek=跳转
+repeat=单曲循环
 skip=跳过
 skipi=序号跳过
 clear=清空播放列表

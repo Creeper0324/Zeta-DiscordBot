@@ -100,6 +100,18 @@ class Playlist:
         else:
             return False
 
+    def append_audios(self, new_audios: List[audio.Audio]) -> int:
+        """批量追加音频，并返回实际加入的数量。"""
+        if not new_audios:
+            return 0
+        available = len(new_audios)
+        if self._limitation is not None:
+            available = max(0, min(available, self._limitation - len(self._playlist)))
+        accepted = new_audios[:available]
+        self._playlist.extend(accepted)
+        self._duration += sum(item.get_duration() for item in accepted)
+        return len(accepted)
+
     def insert_audio(self, new_audio: audio.Audio, index: int) -> bool:
         """
         在播放列表中索引<index>之前插入一个音频，并更新播放列表时长

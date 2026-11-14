@@ -677,6 +677,7 @@ def get_voice_client_status_str(status_code: int) -> str:
 # 每个服务器仅保存运行期播放时钟。队列本身仍由GuildPlaylist管理；机器人重启后
 # 没有正在输出的音频，因此不需要持久化这个状态。
 _playback_states: Dict[int, dict] = {}
+_prefetched_streams: Dict[int, dict] = {}
 
 
 def _new_playback_session(guild_id: int, target_audio: audio.Audio,
@@ -689,6 +690,8 @@ def _new_playback_session(guild_id: int, target_audio: audio.Audio,
         "audio_uid": target_audio.get_uid(),
         "position": position,
         "duration": duration,
+        "force_advance": False,
+        "prefetch_started": False,
     }
     return session_id
 
@@ -710,6 +713,15 @@ def _advance_playback_position(guild_id: int, session_id, pcm_bytes: int) -> Non
     if state is None or state.get("session_id") is not session_id:
         return
     state["position"] = float(state.get("position") or 0) + max(0, int(pcm_bytes)) / 192000.0
+    duration = int(state.get("duration") or 0)
+    remaining = duration - float(state["position"])
+    if duration > 20 and remaining <= 15 and not state.get("prefetch_started"):
+        ctx = state.get("ctx")
+        if ctx is not None:
+            state["prefetch_started"] = True
+            asyncio.run_coroutine_threadsafe(
+                _prefetch_upcoming_stream(ctx, session_id), bot.loop
+            )
 
 
 def _invalidate_playback_session(guild_id: int) -> None:
@@ -717,6 +729,13 @@ def _invalidate_playback_session(guild_id: int) -> None:
     state = _playback_states.get(int(guild_id))
     if state is not None:
         state["session_id"] = object()
+
+
+def _request_manual_advance(guild_id: int) -> None:
+    """标记下一次停止是用户操作；单曲循环不能拦截跳过、移动或清空。"""
+    state = _playback_states.get(int(guild_id))
+    if state is not None:
+        state["force_advance"] = True
 
 
 class _PositionTrackingAudioSource(discord.AudioSource):
@@ -992,6 +1011,30 @@ async def seek(ctx: discord.ApplicationContext, position: str) -> None:
     if not await command_check(ctx):
         return
     await seek_callback(ctx, position)
+
+
+@bot.slash_command(
+    name="repeat",
+    name_localizations=lang.get_command_name("repeat"),
+    description="Toggle repeat for the current track",
+    description_localizations={
+        "zh-CN": "开启或关闭当前歌曲的单曲循环",
+        "en-US": "Toggle repeat for the current track",
+    },
+)
+async def repeat(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer()
+    if not await command_check(ctx):
+        return
+    current_guild = guild_lib.get_guild(ctx)
+    enabled = current_guild.get_play_mode() != 1
+    current_guild.set_play_mode(1 if enabled else 0)
+    await current_guild.refresh_list_view()
+    await embed_respond(
+        ctx,
+        author_name="单曲循环已开启" if enabled else "单曲循环已关闭，恢复顺序播放",
+        silent=True,
+    )
 
 
 @bot.slash_command(name_localizations=lang.get_command_name("skip"), description="跳过正在播放或播放列表中的音频")
@@ -1602,6 +1645,43 @@ async def _resolve_stream_source(target_audio: audio.Audio) -> Tuple[str, str]:
     raise RuntimeError(f"{target_audio.get_download_type().label}不支持流式播放")
 
 
+def _close_prefetched_stream(guild_id: int) -> None:
+    cached = _prefetched_streams.pop(int(guild_id), None)
+    if cached is not None and cached.get("buffer") is not None:
+        cached["buffer"].close()
+
+
+async def _prefetch_upcoming_stream(ctx: discord.ApplicationContext, session_id) -> None:
+    """当前曲目结束前解析并缓冲下一首；队列顺序变化时由UID校验自动作废。"""
+    state = _playback_states.get(int(ctx.guild.id))
+    if state is None or state.get("session_id") is not session_id:
+        return
+    current_guild = guild_lib.get_guild(ctx)
+    current_playlist = current_guild.get_playlist()
+    target_index = 0 if current_guild.get_play_mode() == 1 else 1
+    target_audio = current_playlist.get_audio(target_index)
+    if target_audio is None or not target_audio.is_stream():
+        return
+    try:
+        source, _before_options = await _resolve_stream_source(target_audio)
+        buffered_stream = await _open_prebuffered_http_stream(
+            source, headers=_stream_http_headers(target_audio),
+        )
+    except Exception as exception:
+        await console.rp(
+            f"下一首预缓冲失败，将在切歌时重试：{exception}",
+            ctx.guild, message_type=utils.PrintType.WARNING, print_head=True,
+        )
+        return
+    _close_prefetched_stream(ctx.guild.id)
+    _prefetched_streams[int(ctx.guild.id)] = {
+        "audio_uid": target_audio.get_uid(),
+        "buffer": buffered_stream,
+        "created_at": time.time(),
+    }
+    await console.rp(f"下一首已预缓冲：{target_audio.get_title()}", ctx.guild)
+
+
 async def _download_stream_fallback(target_audio: audio.Audio) -> Result:
     """流式地址失效时，沿用原下载器下载完整文件作为兼容回退。"""
     handler = resource_classifier.handler(target_audio.get_download_type())
@@ -1679,13 +1759,20 @@ async def _handle_playback_after(ctx: discord.ApplicationContext, target_audio: 
         state = _playback_states.get(int(ctx.guild.id))
         if state is None or state.get("session_id") is not session_id:
             return
+        force_advance = bool(state.get("force_advance"))
+    else:
+        force_advance = False
     if target_audio.is_stream() and returncode not in (None, 0):
         if await _fallback_and_replay(
             ctx, target_audio, unlock_now_playing=True,
             start_position=start_position,
         ):
             return
-    await play_next(ctx)
+        force_advance = True
+    if force_advance:
+        await play_next(ctx, force_advance=True)
+    else:
+        await play_next(ctx)
 
 
 async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio, response: Union[discord.Interaction, discord.InteractionMessage, None] = None, function_call: bool = False, allow_stream_fallback: bool = True, start_position: float = 0, start_paused: bool = False, update_playing_message: bool = True) -> None:
@@ -1704,17 +1791,32 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
     before_options = None
     buffered_stream = None
     start_position = max(0.0, float(start_position))
+    if not target_audio.is_stream():
+        _close_prefetched_stream(ctx.guild.id)
     if target_audio.is_stream():
         try:
-            source, before_options = await _resolve_stream_source(target_audio)
-            if start_position > 0:
-                before_options = f"{before_options} {shlex.join(['-ss', str(start_position)])}"
-            else:
-                buffered_stream = await _open_prebuffered_http_stream(
-                    source, headers=_stream_http_headers(target_audio),
-                )
+            prefetched = _prefetched_streams.pop(int(ctx.guild.id), None)
+            if (
+                start_position == 0
+                and prefetched is not None
+                and prefetched.get("audio_uid") == target_audio.get_uid()
+                and time.time() - float(prefetched.get("created_at") or 0) <= 60
+            ):
+                buffered_stream = prefetched["buffer"]
                 source = buffered_stream
                 before_options = "-nostdin"
+            else:
+                if prefetched is not None and prefetched.get("buffer") is not None:
+                    prefetched["buffer"].close()
+                source, before_options = await _resolve_stream_source(target_audio)
+                if start_position > 0:
+                    before_options = f"{before_options} {shlex.join(['-ss', str(start_position)])}"
+                else:
+                    buffered_stream = await _open_prebuffered_http_stream(
+                        source, headers=_stream_http_headers(target_audio),
+                    )
+                    source = buffered_stream
+                    before_options = "-nostdin"
         except Exception as exception:
             if buffered_stream is not None:
                 buffered_stream.close()
@@ -1741,6 +1843,7 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
         session_id = _new_playback_session(
             ctx.guild.id, target_audio, start_position, paused=start_paused,
         )
+        _playback_states[int(ctx.guild.id)]["ctx"] = ctx
 
         def after_playback(_error):
             if buffered_stream is not None:
@@ -1785,7 +1888,7 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
     await current_guild.refresh_list_view()
 
 
-async def play_next(ctx: discord.ApplicationContext) -> None:
+async def play_next(ctx: discord.ApplicationContext, force_advance: bool = False) -> None:
     """
     播放列表中的下一个音频
 
@@ -1797,11 +1900,31 @@ async def play_next(ctx: discord.ApplicationContext) -> None:
 
     await console.rp(f"触发 play_next", ctx.guild)
 
-    # 移除上一个音频
-    finished_audio = current_playlist.pop_audio(0)
-    # 解锁上一个音频
+    finished_audio = current_playlist.get_audio(0)
+    repeat_current = (
+        not force_advance
+        and current_guild.get_play_mode() == 1
+        and finished_audio is not None
+    )
+
+    # 每次播放实例都会持有NOW_PLAYING锁；循环重播前也必须释放一次。
     if finished_audio is not None:
         audio_lib_main.unlock_audio(f"{ctx.guild.id}_NOW_PLAYING", finished_audio)
+
+    if repeat_current:
+        try:
+            await play_audio(ctx, finished_audio, response=None)
+            await console.rp(f"单曲循环：{finished_audio.get_title()}", ctx.guild)
+            return
+        except Exception as exception:
+            await console.on_error(exception)
+            await console.rp(
+                f"单曲循环重播失败，跳过：{finished_audio.get_title()}",
+                ctx.guild, message_type=utils.PrintType.ERROR, print_head=True,
+            )
+
+    # 顺序播放、用户手动跳过或循环重播失败时，移除当前音频。
+    current_playlist.pop_audio(0)
 
     # TODO 制作文件丢失处理方法，当前流程为文件丢失会触发播放Invalid argument，直接触发play_next进入下一个音频
     while len(current_playlist) > 0:
@@ -1814,12 +1937,15 @@ async def play_next(ctx: discord.ApplicationContext) -> None:
                 f"跳过无法播放的音频：{next_audio.get_title()}",
                 ctx.guild, message_type=utils.PrintType.ERROR, print_head=True,
             )
-            current_playlist.pop_audio(0)
+            failed_audio = current_playlist.pop_audio(0)
+            if failed_audio is not None:
+                audio_lib_main.unlock_audio(f"{ctx.guild.id}_NOW_PLAYING", failed_audio)
             continue
         break
 
     if len(current_playlist) == 0:
         _playback_states.pop(int(ctx.guild.id), None)
+        _close_prefetched_stream(ctx.guild.id)
         await console.rp("播放队列已结束", ctx.guild)
         finished_icon_filename = "record_button_in_reveal_animated_0ms_100px.gif"
         await embed_send(ctx, author_name="播放队列已结束", author_icon_url=icon.url(finished_icon_filename), files=icon_lib.files(finished_icon_filename))
@@ -2602,6 +2728,7 @@ async def skip_callback(ctx, first_index: Union[int, str, None] = None, second_i
 
             if voice_client is not None:
                 voice_client_is_paused = voice_client.is_paused()
+                _request_manual_advance(ctx.guild.id)
                 voice_client.stop()
                 # 如果跳过之前正在暂停状态且准备播放下一个音频，则恢复暂停状态
                 if not voice_client.is_playing() and voice_client_is_paused:
@@ -2630,6 +2757,7 @@ async def skip_callback(ctx, first_index: Union[int, str, None] = None, second_i
 
                 # voice_client存在，且是正在播放或者是暂停的状态（为了排除重启后已连接voice_client但未播放的状态）
                 if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
+                    _request_manual_advance(ctx.guild.id)
                     voice_client.stop()
                 else:
                     current_playlist.remove_audio(0)
@@ -2671,6 +2799,7 @@ async def skip_callback(ctx, first_index: Union[int, str, None] = None, second_i
                     current_playlist.remove_audio(i - 1)
 
                 if voice_client is not None:
+                    _request_manual_advance(ctx.guild.id)
                     voice_client.stop()
                 else:
                     current_playlist.remove_audio(0)
@@ -2743,6 +2872,7 @@ async def move_callback(ctx, from_number: Union[int, None] = None, to_number: Un
         current_audio = current_playlist.get_audio(0)
         title = current_audio.get_title()
         current_playlist.insert_audio(current_audio, to_number)
+        _request_manual_advance(ctx.guild.id)
         voice_client.stop()
 
         await console.rp(f"音频 {title} 已被用户 {ctx.author} 移至播放列表第 {to_number} 位", ctx.guild)
@@ -2756,6 +2886,7 @@ async def move_callback(ctx, from_number: Union[int, None] = None, to_number: Un
         current_playlist.remove_audio(from_number - 1)
         current_playlist.insert_audio(current_audio, 1)
         current_playlist.insert_audio(target_song, 1)
+        _request_manual_advance(ctx.guild.id)
         voice_client.stop()
 
         await console.rp(f"音频 {title} 已被用户 {ctx.author} 移至播放列表第 {to_number} 位", ctx.guild)
@@ -2795,6 +2926,7 @@ async def clear_callback(ctx):
         # remove_all跳过正在播放的歌曲
         current_playlist.remove_all(skip_first=True)
         # stop触发play_next删除正在播放的歌曲
+        _request_manual_advance(ctx.guild.id)
         voice_client.stop()
     else:
         current_playlist.remove_all()
@@ -3033,8 +3165,7 @@ class PlaylistMenu(View):
         for button in self.children:
             if isinstance(button, discord.ui.Button) and button.custom_id == "button_play_mode":
                 button.label = self.play_mode_str
-                # TODO 制作播放模式切换
-                button.disabled = True
+                button.disabled = False
                 break
 
         for button in self.children:
@@ -3123,9 +3254,8 @@ class PlaylistMenu(View):
         button.disabled = False
         msg = interaction.response
 
-        temp_code = self.play_mode + 1
-        if temp_code > 4:
-            temp_code = 0
+        # 目前实现并开放顺序播放与单曲循环；避免显示尚未实现的列表/随机模式。
+        temp_code = 0 if self.play_mode == 1 else 1
         self.guild.set_play_mode(temp_code)
 
         await self._refresh_menu(interaction)
@@ -3221,7 +3351,7 @@ class PlaylistMenu(View):
 
 
 class EpisodeSelectMenu(View):
-    MAX_BULK_SELECTION = 10
+    MAX_BULK_SELECTION = 100
 
     def __init__(self, ctx, download_type: DownloadType, info_dict, menu_list, list_type=None, list_title=None, cover_url: Optional[str] = None, timeout=60):
         """
@@ -3448,14 +3578,7 @@ class EpisodeSelectMenu(View):
             total_num = len(self.info_dict["entries"])
 
         if total_num > self.MAX_BULK_SELECTION:
-            self.refresh_pages()
-            self.embed.add_field(
-                name="一次选择的歌曲过多",
-                value=f"歌单共有 {total_num} 首；为避免长时间阻塞，一次最多添加 {self.MAX_BULK_SELECTION} 首。请用数字、逗号或范围选择。",
-                inline=False,
-            )
-            await msg.edit_message(content=None, embed=self.embed, view=self)
-            return
+            total_num = self.MAX_BULK_SELECTION
 
         for num in range(1, total_num + 1):
             final_result.append(num)
@@ -3465,7 +3588,7 @@ class EpisodeSelectMenu(View):
         for item in tuple(self.children):
             if not isinstance(item, discord.ui.Button) or item.custom_id != "button_cancel":
                 self.remove_item(item)
-        self.embed.description = f"已选择全部[{total_num}]首"
+        self.embed.description = f"已选择前[{total_num}]首（单次最多 {self.MAX_BULK_SELECTION} 首）"
         self.embed.timestamp = utils.ctime_datetime()
         await msg.edit_message(content=None, embed=self.embed, view=self)
         await self.play_select(final_result)
@@ -3742,6 +3865,78 @@ class EpisodeSelectMenu(View):
         self.refresh_pages()
         await msg.edit_message(content=None, embed=self.embed, view=self)
 
+    async def _prepare_deferred_audio(self, num: int):
+        """从歌单目录创建队列占位；此处不解析临时媒体地址。"""
+        if (
+            resource_classifier.handler(self.download_type) is DownloadHandler.GO_MUSIC_API
+            and "songs" in self.info_dict
+        ):
+            item = self.info_dict["songs"][num - 1]
+            result = await result_check(
+                await audio_lib_main.download_go_music(item, self.download_type)
+            )
+            return result.result
+
+        entry = dict(self.info_dict["entries"][num - 1])
+        if not entry.get("id") or not entry.get("title"):
+            return None
+        if self.ytdlp_bilibili_parts:
+            url = entry.get("url")
+        elif self.download_type is DownloadType.YOUTUBE_PLAYLIST:
+            url = entry.get("webpage_url") or f"https://www.youtube.com/watch?v={entry['id']}"
+        else:
+            url = entry.get("url") or entry.get("webpage_url")
+        if not url:
+            return None
+        result = await result_check(
+            await audio_lib_main.download_ytdlp(url, entry, self.download_type)
+        )
+        return result.result
+
+    async def _enqueue_deferred_batch(self, final_result) -> int:
+        """批量加入轻量占位，第一首立即播放，其余在轮到时才解析流。"""
+        voice_client = self.ctx.guild.voice_client
+        current_guild = guild_lib.get_guild(self.ctx)
+        current_playlist = current_guild.get_playlist()
+        should_start = current_playlist.is_empty() and not (
+            voice_client.is_playing() or voice_client.is_paused()
+        )
+        prepared = []
+        for num in final_result[:self.MAX_BULK_SELECTION]:
+            if self.cancel_requested:
+                break
+            try:
+                new_audio = await self._prepare_deferred_audio(num)
+            except Exception as exception:
+                await console.on_error(exception)
+                new_audio = None
+            if new_audio is not None:
+                prepared.append((num, new_audio))
+
+        added = current_playlist.append_audios([item[1] for item in prepared])
+        prepared = prepared[:added]
+        if should_start and prepared:
+            try:
+                await play_audio(self.ctx, current_playlist.get_audio(0), response=self.original_msg)
+            except Exception as exception:
+                await console.on_error(exception)
+                await play_next(self.ctx, force_advance=True)
+
+        # Discord Embed有长度限制，只展示开头若干首；完整顺序保留在/playlist。
+        for num, new_audio in prepared[:10]:
+            embed_append_description(
+                self.embed,
+                f"> [{num}] **{new_audio.get_title()}** [{new_audio.get_duration_str()}]",
+            )
+        if len(prepared) > 10:
+            embed_append_description(self.embed, f"> ……其余 {len(prepared) - 10} 首已按目录顺序加入")
+        await console.rp(
+            f"歌单已延迟入队 {len(prepared)} 首；媒体流将在播放到对应歌曲时解析",
+            self.ctx.guild,
+        )
+        await current_guild.refresh_list_view()
+        return len(prepared)
+
     async def play_select(self, final_result, maximum_retry: int = 0):
         voice_client = self.ctx.guild.voice_client
         current_guild = guild_lib.get_guild(self.ctx)
@@ -3761,8 +3956,20 @@ class EpisodeSelectMenu(View):
         embed_append_description(self.embed, f"正在将 {total_num} 个音频添加入播放列表：")
         await eos(self.ctx, self.original_msg, content=None, embed=self.embed, view=self, files=icon_lib.files(self.icon_filename))
 
-        # 原生Bilibili下载器的分P流程；yt-dlp分P使用下面的逐集URL流程。
-        if self.download_type is DownloadType.BILIBILI_P and not self.ytdlp_bilibili_parts:
+        deferred_playlist = (
+            (
+                resource_classifier.handler(self.download_type) is DownloadHandler.GO_MUSIC_API
+                and "songs" in self.info_dict
+            )
+            or self.download_type is DownloadType.YOUTUBE_PLAYLIST
+            or self.ytdlp_bilibili_parts
+        )
+
+        if deferred_playlist:
+            success_num = await self._enqueue_deferred_batch(final_result)
+
+        # 原生Bilibili下载器的分P流程；yt-dlp分P已使用上面的延迟流流程。
+        elif self.download_type is DownloadType.BILIBILI_P and not self.ytdlp_bilibili_parts:
             counter = 1
             for item in self.info_dict["pages"]:
                 if counter in final_result:
